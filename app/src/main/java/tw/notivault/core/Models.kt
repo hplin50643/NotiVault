@@ -49,7 +49,8 @@ data class CapturedNotification(
 
 object ArchiveRules {
     fun date(postTime: Long, zone: String) = Instant.ofEpochMilli(postTime).atZone(ZoneId.of(zone)).toLocalDate()
-    fun expired(date: LocalDate, today: LocalDate, keepDays: Int) = date.isBefore(today.minusDays(keepDays.toLong() - 1))
+    fun firstRetainedDate(today: LocalDate, keepDays: Int) = today.minusDays(keepDays.toLong() - 1)
+    fun expired(date: LocalDate, today: LocalDate, keepDays: Int) = keepDays > 0 && date.isBefore(firstRetainedDate(today, keepDays))
     fun fingerprint(notification: JsonObject): String = sha256(canonical(notification).toByteArray(Charsets.UTF_8))
     private fun canonical(value: JsonElement): String = when (value) {
         is JsonObject -> value.toSortedMap().entries.joinToString(",", "{", "}") { "${VaultJson.encodeToString(it.key)}:${canonical(it.value)}" }

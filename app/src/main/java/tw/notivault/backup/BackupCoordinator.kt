@@ -3,21 +3,26 @@ package tw.notivault.backup
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import androidx.work.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import tw.notivault.VaultApplication
-import tw.notivault.core.sha256
+import tw.notivault.core.ArchiveRules
 import tw.notivault.data.*
 import java.io.File
 import java.time.LocalDate
 import java.time.ZoneId
-import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 fun AppSettings.webDavConfig() = WebDavConfig(serverUrl, remoteDirectory, username, password, allowHttp)
@@ -31,34 +36,89 @@ object NetworkGate {
     }
 }
 
+// WorkManager can start as Wi-Fi connects, before Android moves the default route off mobile.
+internal suspend fun awaitBackupNetwork(allowed: () -> Boolean): Boolean = withTimeoutOrNull(10_000L) {
+    while (!allowed()) delay(250L)
+    true
+} ?: false
+
+internal fun backupConstraints(allowMobile: Boolean): Constraints {
+    val builder = Constraints.Builder()
+    if (allowMobile) return builder.setRequiredNetworkType(NetworkType.CONNECTED).build()
+    val wifi = NetworkRequest.Builder()
+        .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        .build()
+    return builder.setRequiredNetworkRequest(wifi, NetworkType.CONNECTED).build()
+}
+
+internal fun shouldRequestRetentionCatchUp(previous: AppSettings, current: AppSettings): Boolean {
+    if (!current.configured || !current.automaticBackup || current.keepDays == 0) return false
+    return !previous.configured || !previous.automaticBackup || previous.keepDays == 0 || current.keepDays < previous.keepDays ||
+        current.allowMobile != previous.allowMobile || current.destinationId() != previous.destinationId() || current.zoneId != previous.zoneId
+}
+
+internal enum class BackupRun(val workName: String) {
+    PERIODIC("vault-periodic-backup"),
+    MANUAL("vault-manual-backup"),
+    RETENTION("vault-retention-catch-up");
+
+    fun input() = workDataOf("backupRun" to workName)
+}
+
 class BackupCoordinator(private val context: Context, private val settings: SettingsStore, private val repository: ArchiveRepository, private val scope: CoroutineScope) {
     val busy = MutableStateFlow(false)
+    val syncInProgress = MutableStateFlow(false)
     private val mutex = Mutex()
+    private val schedulingMutex = Mutex()
+    private val workManager get() = WorkManager.getInstance(context)
     private val cache = File(context.cacheDir, "backup").apply { mkdirs() }
     private val access = object : BackupAccess {
-        override suspend fun dates() = repository.dao.days().map { it.date }.filter { repository.dao.records(it).isNotEmpty() }
+        override suspend fun dates() = repository.dao.recordDates()
         override suspend fun snapshot(date: String) = repository.snapshot(date)
         override suspend fun receipt(destination: String, date: String) = repository.dao.receipt(destination, date)
         override suspend fun saveReceipt(receipt: BackupReceipt) = repository.dao.saveReceipt(receipt)
         override suspend fun stillCurrent(destination: String) = settings.get().let { it.configured && it.destinationId() == destination && NetworkGate.allowed(context, it.allowMobile) }
+        override suspend fun isExpired(date: LocalDate, today: LocalDate, keepDays: Int): Boolean {
+            val current = settings.get()
+            return ArchiveRules.expired(date, LocalDate.now(ZoneId.of(current.zoneId)), current.keepDays)
+        }
         override suspend fun deleteVerified(date: String, revision: Long, destination: String) = repository.deleteVerified(date, revision, destination)
     }
-    suspend fun sync(): BackupResult = withContext(Dispatchers.IO) {
+
+    internal suspend fun sync(run: BackupRun): BackupResult? = withContext(Dispatchers.IO) {
         mutex.withLock {
+            val configuration = settings.get()
+            if (!configuration.configured || (run != BackupRun.MANUAL && !configuration.automaticBackup)) return@withLock null
+            if (run == BackupRun.RETENTION && !repository.hasExpiredRecords(configuration)) return@withLock null
+            val destination = configuration.destinationId()
             busy.value = true
             try {
-                val configuration = settings.get()
-                check(configuration.configured) { "請先設定 WebDAV" }
-                check(NetworkGate.allowed(context, configuration.allowMobile)) { if (configuration.allowMobile) "等待可用網路" else "等待 Wi-Fi；可在設定中允許行動網路" }
-                val result = BackupEngine(access, cache).sync(WebDavClient(configuration.webDavConfig()), configuration.destinationId(), configuration.installationId,
-                    LocalDate.now(ZoneId.of(configuration.zoneId)), configuration.keepDays) { message -> settings.update { it.copy(backupStatus = message) } }
-                settings.update { it.copy(
+                check(awaitBackupNetwork { NetworkGate.allowed(context, configuration.allowMobile) }) {
+                    if (configuration.allowMobile) "等待可用網路" else "等待 Wi-Fi；可在設定中允許行動網路"
+                }
+                syncInProgress.value = true
+                val result = BackupEngine(access, cache).sync(WebDavClient(configuration.webDavConfig()), destination, configuration.installationId,
+                    LocalDate.now(ZoneId.of(configuration.zoneId)), configuration.keepDays) { message -> updateStatus(destination) { it.copy(backupStatus = message) } }
+                updateStatus(destination) { it.copy(
                     backupStatus = if (result.failures.isEmpty()) "已驗證 ${result.verified} 天 · 清理 ${result.deleted} 天" else "部分備份失敗：${result.failures.take(3).joinToString("；")}",
                     lastBackupAt = if (result.failures.isEmpty()) System.currentTimeMillis() else it.lastBackupAt,
                 ) }
                 result
-            } finally { busy.value = false }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                updateStatus(destination) { it.copy(backupStatus = failure.message ?: "備份失敗，將重試") }
+                throw failure
+            } finally {
+                syncInProgress.value = false
+                busy.value = false
+            }
         }
+    }
+
+    private suspend fun updateStatus(destination: String, transform: (AppSettings) -> AppSettings) {
+        settings.update { if (it.destinationId() == destination) transform(it) else it }
     }
 
     suspend fun testConnection(configuration: AppSettings, progress: (String) -> Unit = {}, timing: (DavRequestTiming) -> Unit = {}): String = withContext(Dispatchers.IO) {
@@ -78,29 +138,72 @@ class BackupCoordinator(private val context: Context, private val settings: Sett
         }
     }
 
-    fun schedule(configuration: AppSettings) {
-        if (!configuration.configured || !configuration.automaticBackup) { runCatching { WorkManager.getInstance(context).cancelUniqueWork("vault-periodic-backup") }; return }
-        val manager = WorkManager.getInstance(context)
-        val request = PeriodicWorkRequestBuilder<BackupWorker>(configuration.backupMinutes.toLong(), TimeUnit.MINUTES)
-            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 15, TimeUnit.MINUTES).build()
-        manager.enqueueUniquePeriodicWork("vault-periodic-backup", ExistingPeriodicWorkPolicy.UPDATE, request)
+    suspend fun schedule(configuration: AppSettings) = schedulingMutex.withLock {
+        if (configuration.configured && configuration.automaticBackup) {
+            val request = PeriodicWorkRequestBuilder<BackupWorker>(configuration.backupMinutes.toLong(), TimeUnit.MINUTES)
+                .setInputData(BackupRun.PERIODIC.input())
+                .setConstraints(backupConstraints(configuration.allowMobile))
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 15, TimeUnit.MINUTES).build()
+            workManager.enqueueUniquePeriodicWork(BackupRun.PERIODIC.workName, ExistingPeriodicWorkPolicy.UPDATE, request).await()
+        } else {
+            workManager.cancelUniqueWork(BackupRun.PERIODIC.workName).await()
+            workManager.cancelUniqueWork(BackupRun.RETENTION.workName).await()
+        }
+        Unit
     }
-    fun enqueueManual() {
-        WorkManager.getInstance(context).enqueueUniqueWork("vault-manual-backup", ExistingWorkPolicy.KEEP,
-            OneTimeWorkRequestBuilder<BackupWorker>().setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 15, TimeUnit.MINUTES).build())
+
+    suspend fun requestRetentionCatchUp(replacePending: Boolean = false) = schedulingMutex.withLock {
+        val configuration = settings.get()
+        if (!configuration.configured || !configuration.automaticBackup || configuration.keepDays == 0) {
+            if (replacePending) workManager.cancelUniqueWork(BackupRun.RETENTION.workName).await()
+            return@withLock
+        }
+        if (repository.hasExpiredRecords(configuration)) {
+            val policy = if (replacePending) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP
+            enqueueOnce(BackupRun.RETENTION, configuration, policy)
+        }
+    }
+
+    suspend fun enqueueManual(): Boolean = schedulingMutex.withLock {
+        val configuration = settings.get()
+        if (!configuration.configured) return@withLock false
+        updateStatus(configuration.destinationId()) { it.copy(backupStatus = "已排程備份，等待符合設定的網路") }
+        enqueueOnce(BackupRun.MANUAL, configuration, ExistingWorkPolicy.REPLACE)
+        true
+    }
+
+    suspend fun refreshPendingManualNetwork() = schedulingMutex.withLock {
+        val configuration = settings.get()
+        if (configuration.configured && workManager.getWorkInfosForUniqueWorkFlow(BackupRun.MANUAL.workName).first().any { it.state == WorkInfo.State.ENQUEUED }) {
+            enqueueOnce(BackupRun.MANUAL, configuration, ExistingWorkPolicy.REPLACE)
+        }
+    }
+
+    fun observeBackupQueued() = combine(
+        workManager.getWorkInfosForUniqueWorkFlow(BackupRun.MANUAL.workName),
+        workManager.getWorkInfosForUniqueWorkFlow(BackupRun.RETENTION.workName),
+    ) { manual, retention -> manual.any { !it.state.isFinished } || retention.any { !it.state.isFinished } }
+
+    private suspend fun enqueueOnce(run: BackupRun, configuration: AppSettings, policy: ExistingWorkPolicy) {
+        val request = OneTimeWorkRequestBuilder<BackupWorker>()
+            .setInputData(run.input())
+            .setConstraints(backupConstraints(configuration.allowMobile))
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 15, TimeUnit.MINUTES).build()
+        workManager.enqueueUniqueWork(run.workName, policy, request).await()
     }
 }
 
 class BackupWorker(context: Context, parameters: WorkerParameters) : CoroutineWorker(context, parameters) {
     override suspend fun doWork(): Result {
         val graph = (applicationContext as VaultApplication).graph
+        val run = BackupRun.entries.firstOrNull { it.workName == inputData.getString("backupRun") } ?: BackupRun.MANUAL
         return try {
-            if (!graph.settings.get().configured) return Result.success()
-            val result = graph.backup.sync()
-            if (result.failures.isEmpty()) Result.success() else Result.retry()
-        } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
-        catch (failure: Exception) { graph.settings.update { it.copy(backupStatus = failure.message ?: "備份失敗，將重試") }; Result.retry() }
+            val result = graph.backup.sync(run)
+            if (result == null || result.failures.isEmpty()) Result.success() else Result.retry()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            Result.retry()
+        }
     }
 }

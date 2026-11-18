@@ -21,6 +21,8 @@ import tw.notivault.capture.NotificationSerializer
 import tw.notivault.core.*
 import java.io.File
 import java.nio.file.Files
+import java.time.LocalDate
+import java.time.ZoneId
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
@@ -68,6 +70,124 @@ class ArchiveRepositoryTest {
             assertFalse(File(recovering.csvDirectory, "${original.archiveDate}.csv").exists())
         } finally { scope.cancel(); database.close(); root.deleteRecursively() }
     }
+
+    @Test fun cleanupRequiresVerificationForTheCurrentSettingsAndRemovesLocalFiles() = runBlocking {
+        withRetentionRepository { repository, settings, root ->
+            val configuration = settings.get()
+            val date = LocalDate.now(ZoneId.of(configuration.zoneId)).minusDays(20).toString()
+            repository.capture(captureForDate(date, "過期通知"))
+            val snapshot = requireNotNull(repository.snapshot(date))
+            val event = repository.dao.records(date).single()
+            val destination = configuration.destinationId()
+            val payload = File(root, "files/snapshots/${event.eventId}.json")
+            val dailyCsv = File(repository.csvDirectory, "$date.csv")
+            assertFalse(repository.deleteVerified(date, snapshot.revision, destination))
+
+            val receipt = verifiedReceipt(snapshot, destination)
+            repository.dao.saveReceipt(receipt.copy(pendingHash = "unfinished-publication"))
+            assertFalse(repository.deleteVerified(date, snapshot.revision, destination))
+
+            repository.dao.saveReceipt(receipt)
+            settings.update { it.copy(keepDays = 0) }
+            assertFalse(repository.deleteVerified(date, snapshot.revision, destination))
+
+            settings.update { it.copy(keepDays = 7, remoteDirectory = "new-destination") }
+            assertFalse(repository.deleteVerified(date, snapshot.revision, destination))
+            assertTrue(payload.exists())
+            assertTrue(dailyCsv.exists())
+
+            val currentDestination = settings.get().destinationId()
+            repository.dao.saveReceipt(receipt.copy(destination = currentDestination))
+            assertTrue(repository.deleteVerified(date, snapshot.revision, currentDestination))
+            assertTrue(repository.dao.records(date).isEmpty())
+            assertFalse(payload.exists())
+            assertFalse(dailyCsv.exists())
+            assertFalse(requireNotNull(repository.dao.day(date)).deleting)
+        }
+    }
+
+    @Test fun aNewVersionArrivingAfterTheVerifiedSnapshotPreventsPruning() = runBlocking {
+        withRetentionRepository { repository, settings, _ ->
+            val configuration = settings.get()
+            val date = LocalDate.now(ZoneId.of(configuration.zoneId)).minusDays(20).toString()
+            repository.capture(captureForDate(date, "第一版"))
+            val snapshot = requireNotNull(repository.snapshot(date))
+            val destination = configuration.destinationId()
+            repository.dao.saveReceipt(verifiedReceipt(snapshot, destination))
+
+            repository.capture(captureForDate(date, "第二版"))
+
+            assertFalse(repository.deleteVerified(date, snapshot.revision, destination))
+            assertEquals(listOf(1, 2), repository.dao.records(date).map { it.version }.sorted())
+            assertFalse(requireNotNull(repository.dao.day(date)).deleting)
+        }
+    }
+
+    @Test fun snapshotRetryFinishesAnInterruptedDeletionInTheSameProcess() = runBlocking {
+        withRetentionRepository { repository, settings, root ->
+            val configuration = settings.get()
+            val date = LocalDate.now(ZoneId.of(configuration.zoneId)).minusDays(20).toString()
+            repository.capture(captureForDate(date, "第一版"))
+            repository.capture(captureForDate(date, "第二版"))
+            val snapshot = requireNotNull(repository.snapshot(date))
+            repository.dao.saveReceipt(verifiedReceipt(snapshot, configuration.destinationId()))
+            val payloads = repository.dao.records(date).map { File(root, "files/snapshots/${it.eventId}.json") }
+            val day = requireNotNull(repository.dao.day(date))
+            repository.dao.saveDay(day.copy(deleting = true))
+            assertTrue(payloads.first().delete())
+
+            assertNull(repository.snapshot(date))
+            assertFalse(requireNotNull(repository.dao.day(date)).deleting)
+            assertTrue(repository.dao.records(date).isEmpty())
+            assertTrue(payloads.none { it.exists() })
+            assertFalse(File(repository.csvDirectory, "$date.csv").exists())
+        }
+    }
+
+    @Test fun onlyRecordsOutsideTheRetentionWindowCallForCatchUp() = runBlocking {
+        withRetentionRepository { repository, settings, _ ->
+            val configuration = settings.get()
+            val today = LocalDate.now(ZoneId.of(configuration.zoneId))
+            repository.capture(captureForDate(today.minusDays(5).toString(), "期限內"))
+            assertFalse(repository.hasExpiredRecords(configuration))
+
+            repository.capture(captureForDate(today.minusDays(8).toString(), "已到期"))
+            assertTrue(repository.hasExpiredRecords(configuration))
+            assertFalse(repository.hasExpiredRecords(configuration.copy(keepDays = 0)))
+        }
+    }
+
+    private suspend fun withRetentionRepository(test: suspend (ArchiveRepository, SettingsStore, File) -> Unit) {
+        val baseContext = ApplicationProvider.getApplicationContext<Context>()
+        val root = Files.createTempDirectory("vault-retention").toFile()
+        val context = object : ContextWrapper(baseContext) {
+            override fun getFilesDir() = File(root, "files").apply { mkdirs() }
+            override fun getCacheDir() = File(root, "cache").apply { mkdirs() }
+        }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val preferences = PreferenceDataStoreFactory.create(scope = scope) { File(root, "settings.preferences_pb") }
+        val settings = SettingsStore(context, preferences)
+        val database = Room.inMemoryDatabaseBuilder(baseContext, VaultDatabase::class.java).build()
+        try {
+            settings.update { it.copy(serverUrl = "https://dav.example/") }
+            test(ArchiveRepository(context, database, settings, scope), settings, root)
+        } finally {
+            scope.coroutineContext.job.cancelAndJoin()
+            database.close()
+            root.deleteRecursively()
+        }
+    }
+
+    private fun captureForDate(date: String, text: String): CapturedNotification {
+        val record = fixture(date = date, text = text)
+        return CapturedNotification(record.postTime, record.notificationKey, record.packageName, record.appLabel, record.title,
+            record.text, record.sbnJson, record.notificationJson, record.rankingJson, record.serializationErrors)
+    }
+
+    private fun verifiedReceipt(snapshot: LocalSnapshot, destination: String) = BackupReceipt(
+        destination, snapshot.date, remoteHash = sha256(snapshot.file), verifiedRevision = snapshot.revision,
+        verifiedAt = System.currentTimeMillis(),
+    )
 
     @Test fun publicNotificationSnapshotIncludesBitmapBase64AndArbitraryExtrasOnAndroid10() {
         val context = ApplicationProvider.getApplicationContext<Context>()

@@ -30,7 +30,15 @@ class ArchiveRepository(private val context: Context, val database: VaultDatabas
         scope.launch {
             try {
                 mutex.withLock {
-                    dao.days().filter { it.deleting }.forEach { finishDeletion(it) }
+                    dao.days().filter { it.deleting }.forEach { day ->
+                        try {
+                            finishDeletion(day)
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (failure: Exception) {
+                            error.value = "無法接續清理 ${day.date}：${failure.message}"
+                        }
+                    }
                     val known = dao.allIds().toHashSet()
                     payloads.listFiles()?.filter { it.nameWithoutExtension !in known }?.forEach { it.delete() }
                     csvDirectory.listFiles()?.filter { it.name.endsWith(".pending") }?.forEach { it.delete() }
@@ -54,7 +62,8 @@ class ArchiveRepository(private val context: Context, val database: VaultDatabas
             val fingerprint = ArchiveRules.fingerprint(capture.notification)
             val previous = dao.active(capture.key)
             if (previous?.fingerprint == fingerprint) return@withLock
-            val configuration = settings.get()
+            val configuration = settings.getCaptureSettings()
+            if (!configuration.recordsPackage(capture.packageName)) return@withLock
             val date = ArchiveRules.date(capture.postTime, configuration.zoneId).toString()
             dao.day(date)?.takeIf { it.deleting }?.let { finishDeletion(it) }
             val record = NotificationRecord(capture.postTime, capture.capturedAt, UUID.randomUUID().toString(),
@@ -77,10 +86,22 @@ class ArchiveRepository(private val context: Context, val database: VaultDatabas
     suspend fun read(eventId: String): NotificationRecord = withContext(Dispatchers.IO) { readRecord(payloadFile(eventId)) }
     suspend fun page(date: String, app: String = "", search: String = "", offset: Int = 0) = dao.page(date, app, search, 50, offset)
     suspend fun exportDirty() { ready.await(); mutex.withLock { dao.days().filter { it.exportedRevision != it.revision && !it.deleting }.forEach { exportLocked(it) } } }
+
+    suspend fun hasExpiredRecords(configuration: AppSettings): Boolean {
+        if (configuration.keepDays == 0) return false
+        ready.await()
+        val today = LocalDate.now(ZoneId.of(configuration.zoneId))
+        return dao.hasRecordsBefore(ArchiveRules.firstRetainedDate(today, configuration.keepDays).toString())
+    }
+
     suspend fun snapshot(date: String): LocalSnapshot? {
         ready.await()
         return mutex.withLock {
             val day = dao.day(date) ?: return@withLock null
+            if (day.deleting) {
+                finishDeletion(day)
+                return@withLock null
+            }
             if (dao.records(date).isEmpty()) return@withLock null
             exportLocked(day)
             val file = File(context.cacheDir, "backup-local-${UUID.randomUUID()}.csv")
@@ -102,16 +123,24 @@ class ArchiveRepository(private val context: Context, val database: VaultDatabas
         return mutex.withLock {
             val day = dao.day(date) ?: return@withLock false
             val receipt = dao.receipt(destination, date) ?: return@withLock false
-            val current = settings.get()
-            if (day.revision != revision || receipt.verifiedRevision != revision || receipt.remoteHash.isBlank() || current.destinationId() != destination) return@withLock false
-            if (current.keepDays == 0 || !ArchiveRules.expired(LocalDate.parse(date), LocalDate.now(ZoneId.of(current.zoneId)), current.keepDays)) return@withLock false
-            dao.saveDay(day.copy(deleting = true))
-            finishDeletion(day.copy(deleting = true))
+            if (day.revision != revision || receipt.verifiedRevision != revision || receipt.remoteHash.isBlank() || receipt.pendingHash.isNotBlank()) return@withLock false
+            val deleting = day.copy(deleting = true)
+            val started = settings.withCurrentSettings { current ->
+                val today = LocalDate.now(ZoneId.of(current.zoneId))
+                if (!current.configured || current.destinationId() != destination || !ArchiveRules.expired(LocalDate.parse(date), today, current.keepDays)) {
+                    return@withCurrentSettings false
+                }
+                dao.saveDay(deleting)
+                true
+            }
+            if (!started) return@withLock false
+            finishDeletion(deleting)
             true
         }
     }
 
-    private suspend fun finishDeletion(day: ArchiveDay) {
+    // The journal already records a verified deletion. Finish local files and indexes even if a worker is cancelled.
+    private suspend fun finishDeletion(day: ArchiveDay) = withContext(NonCancellable) {
         val records = dao.records(day.date)
         records.forEach { check(!payloadFile(it.eventId).exists() || payloadFile(it.eventId).delete()) { "無法刪除本機快照" } }
         val csv = File(csvDirectory, "${day.date}.csv")
@@ -120,8 +149,12 @@ class ArchiveRepository(private val context: Context, val database: VaultDatabas
             dao.deleteRecords(day.date)
             dao.saveDay(day.copy(revision = day.revision + 1, exportedRevision = day.revision + 1, deleting = false))
         }
-        database.openHelper.writableDatabase.query("PRAGMA wal_checkpoint(TRUNCATE)").use { it.moveToFirst() }
-        database.openHelper.writableDatabase.execSQL("PRAGMA incremental_vacuum(256)")
+        val sqlite = database.openHelper.writableDatabase
+        sqlite.query("PRAGMA incremental_vacuum(256)").use { cursor ->
+            while (cursor.moveToNext()) { /* SQLite frees pages as the statement advances. */ }
+        }
+        sqlite.query("PRAGMA wal_checkpoint(TRUNCATE)").use { it.moveToFirst() }
+        Unit
     }
 
     fun storageBytes(): Long = listOf(context.filesDir, context.getDatabasePath("vault.db").parentFile).filterNotNull()

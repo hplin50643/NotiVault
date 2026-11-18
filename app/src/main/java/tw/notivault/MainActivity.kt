@@ -23,6 +23,10 @@ data class ConnectionTestState(val running: Boolean = false, val stage: String =
 class MainActivity : ComponentActivity() {
     private val model: VaultViewModel by viewModels()
     override fun onCreate(savedInstanceState: Bundle?) { super.onCreate(savedInstanceState); enableEdgeToEdge(); setContent { VaultApp(model) } }
+    override fun onStart() {
+        super.onStart()
+        model.checkRetentionOnOpen()
+    }
 }
 
 class VaultViewModel(application: android.app.Application) : AndroidViewModel(application) {
@@ -32,6 +36,8 @@ class VaultViewModel(application: android.app.Application) : AndroidViewModel(ap
     val apps = graph.repository.apps.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
     val connected = graph.listenerConnected
     val busy = graph.backup.busy
+    val syncInProgress = graph.backup.syncInProgress
+    val backupQueued = graph.backup.observeBackupQueued().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
     val captureError = graph.repository.error
     val message = MutableStateFlow<String?>(null)
     val storage = MutableStateFlow(0L)
@@ -78,10 +84,23 @@ class VaultViewModel(application: android.app.Application) : AndroidViewModel(ap
         }
     }
     fun cancelServerTest() { connectionTestJob?.cancel() }
-    fun backupNow() { viewModelScope.launch {
-        if (!settings.value.configured) { notify("請先儲存 WebDAV 連線設定"); return@launch }
-        graph.settings.update { it.copy(backupStatus = "已排程備份，等待符合設定的網路") }
-        graph.backup.enqueueManual(); notify("備份工作已排程")
+    fun checkRetentionOnOpen() { viewModelScope.launch(Dispatchers.IO) {
+        try {
+            graph.backup.requestRetentionCatchUp()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            notify("備份排程失敗：${failure.message}")
+        }
+    } }
+    fun backupNow() { viewModelScope.launch(Dispatchers.IO) {
+        try {
+            notify(if (graph.backup.enqueueManual()) "備份工作已排程" else "請先儲存 WebDAV 連線設定")
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            notify("備份排程失敗：${failure.message}")
+        }
     } }
     fun showDetail(id: String, fromRemote: Boolean) { viewModelScope.launch(Dispatchers.IO) {
         runCatching { if (fromRemote) remote.read(id) else graph.repository.read(id) }.onSuccess { detail.value = it }.onFailure { notify("無法讀取通知：${it.message}") }

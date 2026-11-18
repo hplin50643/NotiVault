@@ -95,7 +95,7 @@ fun VaultApp(model: VaultViewModel) {
                     0 -> Dashboard(model, counts, authorized, connected, onHistory = { page = 1 }, onBackup = { page = 2 })
                     1 -> HistoryScreen(model, counts, configuration)
                     2 -> WebDavScreen(model, configuration, onHistory = { model.requestRemoteHistory.value = true; page = 1 })
-                    3 -> SettingsScreen(model, configuration, authorized, connected)
+                    3 -> SettingsScreen(model, configuration, counts, authorized, connected)
                 } } }
             }
         }
@@ -326,9 +326,10 @@ private fun Dashboard(model: VaultViewModel, counts: List<DayCount>, authorized:
     }
 }
 
-@Composable private fun SettingsScreen(model: VaultViewModel, settings: AppSettings, authorized: Boolean, connected: Boolean) {
+@Composable private fun SettingsScreen(model: VaultViewModel, settings: AppSettings, counts: List<DayCount>, authorized: Boolean, connected: Boolean) {
     val context = LocalContext.current
     var customDays by remember { mutableStateOf(false) }
+    var choosingApps by rememberSaveable { mutableStateOf(false) }
     var days by remember { mutableStateOf(settings.keepDays.toString()) }
     val scope = rememberCoroutineScope()
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(22.dp, 25.dp, 22.dp, 28.dp), verticalArrangement = Arrangement.spacedBy(22.dp)) {
@@ -339,10 +340,24 @@ private fun Dashboard(model: VaultViewModel, counts: List<DayCount>, authorized:
             OutlinedButton({ openNotificationAccess(context) }, Modifier.fillMaxWidth()) { Text("管理通知存取權限") }
         } }
         item { VaultCard {
-            SectionTitle("本機保留", "確認遠端內容一致後，才會刪除到期資料")
-            ChoiceMenu("保存天數", if (settings.keepDays == 0) "不限" else "${settings.keepDays} 天", listOf("7" to "7 天", "14" to "14 天", "30" to "30 天", "0" to "不限天數", "custom" to "自訂天數")) { value -> if (value == "custom") { days = settings.keepDays.coerceAtLeast(1).toString(); customDays = true } else model.update { it.copy(keepDays = value.toInt()) } }
-            Text("以今天及之前的日曆日計算。未備份、驗證失敗或設定尚未完成時，資料會繼續保留，因此可能超過指定天數。", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            val currentSelection = when {
+                settings.recordAllApps -> "全部記錄"
+                settings.includedPackages.isEmpty() -> "已暫停記錄"
+                else -> "只記錄 ${settings.includedPackages.size} 個 App"
+            }
+            SectionTitle("記錄通知的 App", currentSelection)
+            OutlinedButton({ choosingApps = true }, Modifier.fillMaxWidth()) { Text("選擇 App") }
         } }
+        item {
+            RetentionSettings(model, settings, counts) { value ->
+                if (value == "custom") {
+                    days = settings.keepDays.coerceAtLeast(1).toString()
+                    customDays = true
+                } else {
+                    model.update { it.copy(keepDays = value.toInt()) }
+                }
+            }
+        }
         item { VaultCard {
             SectionTitle("備份排程")
             PreferenceRow(Icons.Rounded.Sync, "自動備份", "系統依網路與省電狀態安排執行", settings.automaticBackup) { value -> model.update { it.copy(automaticBackup = value) } }
@@ -363,6 +378,15 @@ private fun Dashboard(model: VaultViewModel, counts: List<DayCount>, authorized:
         } }
         item { Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(5.dp)) { Text("通知典藏 ${tw.notivault.BuildConfig.VERSION_NAME}", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant); Text("每一則，都有歸處。", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .6f)) } }
     }
+    if (choosingApps) NotificationAppPicker(
+        settings = settings,
+        onDismiss = { choosingApps = false },
+        onSave = { all, packages ->
+            model.update { it.copy(recordAllApps = all, includedPackages = packages) }
+            choosingApps = false
+        },
+        loadApps = { installedNotificationApps(context) },
+    )
     if (customDays) AlertDialog(onDismissRequest = { customDays = false }, title = { Text("自訂保留天數") }, text = { OutlinedTextField(days, { days = it.filter(Char::isDigit).take(4) }, label = { Text("1–3650 天") }, singleLine = true, keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number)) }, confirmButton = { TextButton({ days.toIntOrNull()?.takeIf { it in 1..3650 }?.let { value -> model.update { it.copy(keepDays = value) }; customDays = false } }, enabled = days.toIntOrNull() in 1..3650) { Text("儲存") } }, dismissButton = { TextButton({ customDays = false }) { Text("取消") } })
 }
 internal fun intervalLabel(minutes: Int) = when (minutes) { 15 -> "15 分鐘"; 30 -> "30 分鐘"; 60 -> "1 小時"; 360 -> "6 小時"; else -> "24 小時" }

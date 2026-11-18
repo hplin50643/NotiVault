@@ -34,6 +34,10 @@ interface VaultDao {
     suspend fun page(date: String, app: String, search: String, limit: Int, offset: Int): List<RecordIndex>
     @Query("SELECT * FROM records WHERE archiveDate = :date ORDER BY postTime, capturedAt, eventId")
     suspend fun records(date: String): List<RecordIndex>
+    @Query("SELECT DISTINCT archiveDate FROM records ORDER BY archiveDate")
+    suspend fun recordDates(): List<String>
+    @Query("SELECT EXISTS(SELECT 1 FROM records WHERE archiveDate < :cutoff)")
+    suspend fun hasRecordsBefore(cutoff: String): Boolean
     @Query("SELECT eventId FROM records") suspend fun allIds(): List<String>
     @Insert suspend fun insert(record: RecordIndex)
     @Insert fun insertBatch(records: List<RecordIndex>)

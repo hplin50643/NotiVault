@@ -73,6 +73,20 @@ class BackupEngineTest {
         access.records = listOf(fixture(date = "2026-11-02"))
         assertEquals(1, sync().verified); assertFalse(access.deleted)
     }
+    @Test fun seventhCalendarDayRemainsOnPhoneAfterVerification() {
+        access.records = listOf(fixture(date = "2026-10-27"))
+        val result = sync()
+        assertEquals(1, result.verified)
+        assertEquals(0, result.deleted)
+        assertFalse(access.deleted)
+    }
+    @Test fun eighthCalendarDayIsRemovedAfterVerification() {
+        access.records = listOf(fixture(date = "2026-10-26"))
+        val result = sync()
+        assertEquals(1, result.verified)
+        assertEquals(1, result.deleted)
+        assertTrue(access.deleted)
+    }
     @Test fun previouslyVerifiedButMissingRemoteIsNotReplacedWithPartialData() {
         access.receipt = BackupReceipt("destination", date, remoteHash = "known-old")
         assertTrue(sync().failures.single().contains("不存在")); assertFalse(access.deleted)

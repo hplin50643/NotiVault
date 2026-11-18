@@ -14,6 +14,7 @@ interface BackupAccess {
     suspend fun receipt(destination: String, date: String): BackupReceipt?
     suspend fun saveReceipt(receipt: BackupReceipt)
     suspend fun stillCurrent(destination: String): Boolean
+    suspend fun isExpired(date: LocalDate, today: LocalDate, keepDays: Int): Boolean = ArchiveRules.expired(date, today, keepDays)
     suspend fun deleteVerified(date: String, revision: Long, destination: String): Boolean
 }
 
@@ -96,7 +97,7 @@ class BackupEngine(private val access: BackupAccess, private val cache: File) {
                 check(access.stillCurrent(destination)) { "備份設定已變更，保留本機資料" }
                 access.saveReceipt(receipt.copy(remoteHash = expectedHash, pendingHash = "", verifiedRevision = snapshot.revision, verifiedAt = System.currentTimeMillis()))
                 verified++
-                if (keepDays > 0 && ArchiveRules.expired(parsedDate, today, keepDays)) {
+                if (access.isExpired(parsedDate, today, keepDays)) {
                     progress("清理已驗證的本機資料 · $date")
                     if (access.deleteVerified(date, snapshot.revision, destination)) deleted++
                 }
