@@ -33,7 +33,13 @@ class BackupEngineTest {
         client = WebDavClient(WebDavConfig(server.url("/").toString(), "vault", "user", "secret", true))
     }
     @After fun teardown() { server.shutdown(); root.deleteRecursively() }
-    private fun sync(keep: Int = 7) = runBlocking { BackupEngine(access, root).sync(client, "destination", "device", LocalDate.of(2026, 11, 2), keep) {} }
+    private fun sync(
+        keep: Int = 7,
+        selection: BackupSelection = BackupSelection.ALL,
+        progress: suspend (String) -> Unit = {},
+    ) = runBlocking {
+        BackupEngine(access, root).sync(client, "destination", "device", LocalDate.of(2026, 11, 2), keep, selection, progress)
+    }
 
     @Test fun verifiedOldDayCanBeDeletedAndCsvIsComplete() {
         val result = sync()
@@ -122,11 +128,90 @@ class BackupEngineTest {
         access.receipt = BackupReceipt("destination", date, pendingHash = sha256(value))
         assertEquals(1, sync().verified); assertEquals("", access.receipt?.pendingHash)
     }
+    @Test fun periodicSyncSkipsAnUnchangedVerifiedRetainedDay() {
+        assertEquals(1, sync(keep = 30).verified)
+        val requests = server.requestCount
+        val snapshots = access.snapshotCount
+
+        val result = sync(keep = 30, selection = BackupSelection.CHANGED_OR_EXPIRED)
+
+        assertEquals(BackupResult(0, 0, emptyList()), result)
+        assertEquals(requests, server.requestCount)
+        assertEquals(snapshots, access.snapshotCount)
+    }
+    @Test fun periodicSyncUploadsANewRevisionOfAVerifiedDay() {
+        assertEquals(1, sync(keep = 30).verified)
+        access.records = access.records + fixture("new-event")
+        access.revision++
+
+        val result = sync(keep = 30, selection = BackupSelection.CHANGED_OR_EXPIRED)
+
+        assertEquals(BackupResult(1, 0, emptyList()), result)
+        val records = mutableListOf<NotificationRecord>()
+        dav.files.getValue(destinationPath).inputStream().use { CsvCodec.read(it) { record -> records += record } }
+        assertEquals(setOf("event-1", "new-event"), records.map { it.eventId }.toSet())
+        assertEquals(access.revision, access.receipt?.verifiedRevision)
+    }
+    @Test fun periodicProgressOnlyCountsDaysThatNeedWork() {
+        assertEquals(1, sync(keep = 30).verified)
+        val newDate = "2026-10-30"
+        access.records = access.records + fixture("new-event", date = newDate)
+        val messages = mutableListOf<String>()
+        val snapshots = access.snapshotCount
+
+        val result = sync(keep = 30, selection = BackupSelection.CHANGED_OR_EXPIRED) { messages += it }
+
+        assertEquals(BackupResult(1, 0, emptyList()), result)
+        assertEquals(snapshots + 1, access.snapshotCount)
+        assertEquals(listOf("備份 1/1 · $newDate", "驗證遠端內容 · $newDate"), messages)
+    }
+    @Test fun periodicSyncRecoversPendingWorkEvenWhenVerifiedRevisionMatches() {
+        assertEquals(1, sync(keep = 30).verified)
+        val receipt = requireNotNull(access.receipt)
+        access.receipt = receipt.copy(pendingHash = receipt.remoteHash)
+        val snapshots = access.snapshotCount
+
+        val result = sync(keep = 30, selection = BackupSelection.CHANGED_OR_EXPIRED)
+
+        assertEquals(BackupResult(1, 0, emptyList()), result)
+        assertEquals(snapshots + 1, access.snapshotCount)
+        assertEquals("", access.receipt?.pendingHash)
+    }
+    @Test fun cleanupDownloadsAnUnchangedExpiredDayOnceBeforeDeleting() {
+        assertEquals(1, sync(keep = 30).verified)
+        val requests = server.requestCount
+        val snapshots = access.snapshotCount
+
+        val result = sync(selection = BackupSelection.EXPIRED_ONLY)
+
+        assertEquals(BackupResult(1, 1, emptyList()), result)
+        assertEquals(requests + 1, server.requestCount)
+        assertEquals(snapshots, access.snapshotCount)
+    }
+    @Test fun cleanupPreservesAnUnchangedExpiredDayIfRemoteFileChanged() {
+        assertEquals(1, sync(keep = 30).verified)
+        dav.files[destinationPath] = csv(listOf(fixture(text = "遠端被修改")))
+
+        val result = sync(selection = BackupSelection.CHANGED_OR_EXPIRED)
+
+        assertTrue(result.failures.single().contains("其他程式"))
+        assertFalse(access.deleted)
+    }
+    @Test fun retentionCatchUpSkipsUnexpiredDaysEvenBeforeTheirFirstBackup() {
+        val result = sync(keep = 30, selection = BackupSelection.EXPIRED_ONLY)
+
+        assertEquals(BackupResult(0, 0, emptyList()), result)
+        assertEquals(0, server.requestCount)
+        assertEquals(0, access.snapshotCount)
+    }
 
     private class FakeAccess(val root: File, var records: List<NotificationRecord>) : BackupAccess {
         var revision = 1L; var current = true; var deleted = false; var receipt: BackupReceipt? = null
+        var snapshotCount = 0
         override suspend fun dates() = records.map { it.archiveDate }.distinct()
+        override suspend fun revision(date: String) = revision.takeIf { records.any { it.archiveDate == date } }
         override suspend fun snapshot(date: String): LocalSnapshot {
+            snapshotCount++
             val file = File(root, "local-${System.nanoTime()}.csv"); file.writeBytes(csv(records.filter { it.archiveDate == date }))
             return LocalSnapshot(date, revision, file)
         }

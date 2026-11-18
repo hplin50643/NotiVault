@@ -75,6 +75,7 @@ class BackupCoordinator(private val context: Context, private val settings: Sett
     private val cache = File(context.cacheDir, "backup").apply { mkdirs() }
     private val access = object : BackupAccess {
         override suspend fun dates() = repository.dao.recordDates()
+        override suspend fun revision(date: String) = repository.dao.day(date)?.takeUnless { it.deleting }?.revision
         override suspend fun snapshot(date: String) = repository.snapshot(date)
         override suspend fun receipt(destination: String, date: String) = repository.dao.receipt(destination, date)
         override suspend fun saveReceipt(receipt: BackupReceipt) = repository.dao.saveReceipt(receipt)
@@ -98,12 +99,33 @@ class BackupCoordinator(private val context: Context, private val settings: Sett
                     if (configuration.allowMobile) "等待可用網路" else "等待 Wi-Fi；可在設定中允許行動網路"
                 }
                 syncInProgress.value = true
-                val result = BackupEngine(access, cache).sync(WebDavClient(configuration.webDavConfig()), destination, configuration.installationId,
-                    LocalDate.now(ZoneId.of(configuration.zoneId)), configuration.keepDays) { message -> updateStatus(destination) { it.copy(backupStatus = message) } }
-                updateStatus(destination) { it.copy(
-                    backupStatus = if (result.failures.isEmpty()) "已驗證 ${result.verified} 天 · 清理 ${result.deleted} 天" else "部分備份失敗：${result.failures.take(3).joinToString("；")}",
-                    lastBackupAt = if (result.failures.isEmpty()) System.currentTimeMillis() else it.lastBackupAt,
-                ) }
+                val selection = when (run) {
+                    BackupRun.PERIODIC -> BackupSelection.CHANGED_OR_EXPIRED
+                    BackupRun.MANUAL -> BackupSelection.ALL
+                    BackupRun.RETENTION -> BackupSelection.EXPIRED_ONLY
+                }
+                val result = BackupEngine(access, cache).sync(
+                    WebDavClient(configuration.webDavConfig()),
+                    destination,
+                    configuration.installationId,
+                    LocalDate.now(ZoneId.of(configuration.zoneId)),
+                    configuration.keepDays,
+                    selection,
+                ) { message ->
+                    updateStatus(destination) { it.copy(backupStatus = message) }
+                }
+                updateStatus(destination) { current ->
+                    val status = when {
+                        result.failures.isNotEmpty() -> "部分備份失敗：${result.failures.take(3).joinToString("；")}"
+                        result.verified == 0 -> "目前沒有需要備份或清理的日期"
+                        else -> "已驗證 ${result.verified} 天 · 清理 ${result.deleted} 天"
+                    }
+                    val lastBackupAt = if (result.verified > 0 && result.failures.isEmpty()) {
+                        System.currentTimeMillis()
+                    } else current.lastBackupAt
+                    if (status == current.backupStatus && lastBackupAt == current.lastBackupAt) current
+                    else current.copy(backupStatus = status, lastBackupAt = lastBackupAt)
+                }
                 result
             } catch (cancelled: CancellationException) {
                 throw cancelled

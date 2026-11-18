@@ -3,7 +3,6 @@ package tw.notivault.data
 import android.content.Context
 import androidx.room.withTransaction
 import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -23,7 +22,6 @@ class ArchiveRepository(private val context: Context, val database: VaultDatabas
     val counts = dao.observeCounts()
     val apps = dao.observeApps()
     val error = MutableStateFlow<String?>(null)
-    private val exportSignals = Channel<Unit>(Channel.CONFLATED)
     private val ready = CompletableDeferred<Unit>()
 
     init {
@@ -44,15 +42,7 @@ class ArchiveRepository(private val context: Context, val database: VaultDatabas
                     csvDirectory.listFiles()?.filter { it.name.endsWith(".pending") }?.forEach { it.delete() }
                 }
                 ready.complete(Unit)
-                exportSignals.trySend(Unit)
             } catch (failure: Exception) { error.value = failure.message; ready.completeExceptionally(failure) }
-        }
-        scope.launch {
-            ready.await()
-            for (signal in exportSignals) {
-                delay(1200)
-                runCatching { exportDirty() }.onFailure { error.value = "CSV 產生失敗：${it.message}" }
-            }
         }
     }
 
@@ -77,7 +67,6 @@ class ArchiveRepository(private val context: Context, val database: VaultDatabas
                 val day = dao.day(date) ?: ArchiveDay(date)
                 dao.saveDay(day.copy(revision = day.revision + 1, deleting = false))
             }
-            exportSignals.trySend(Unit)
         }
     }
 
@@ -85,7 +74,6 @@ class ArchiveRepository(private val context: Context, val database: VaultDatabas
     suspend fun reconcileActive(keys: Set<String>) { ready.await(); mutex.withLock { dao.activeKeys().filter { it !in keys }.forEach { dao.removeActive(it) } } }
     suspend fun read(eventId: String): NotificationRecord = withContext(Dispatchers.IO) { readRecord(payloadFile(eventId)) }
     suspend fun page(date: String, app: String = "", search: String = "", offset: Int = 0) = dao.page(date, app, search, 50, offset)
-    suspend fun exportDirty() { ready.await(); mutex.withLock { dao.days().filter { it.exportedRevision != it.revision && !it.deleting }.forEach { exportLocked(it) } } }
 
     suspend fun hasExpiredRecords(configuration: AppSettings): Boolean {
         if (configuration.keepDays == 0) return false
@@ -102,19 +90,19 @@ class ArchiveRepository(private val context: Context, val database: VaultDatabas
                 finishDeletion(day)
                 return@withLock null
             }
-            if (dao.records(date).isEmpty()) return@withLock null
-            exportLocked(day)
+            val csv = File(csvDirectory, "$date.csv")
+            if (day.exportedRevision != day.revision || !csv.isFile) {
+                val records = dao.records(date)
+                if (records.isEmpty()) return@withLock null
+                atomicWrite(csv) { output ->
+                    CsvCodec.write(output, records.asSequence().map { readRecord(payloadFile(it.eventId)) })
+                }
+                dao.saveDay(day.copy(exportedRevision = day.revision))
+            }
             val file = File(context.cacheDir, "backup-local-${UUID.randomUUID()}.csv")
-            File(csvDirectory, "$date.csv").copyTo(file, overwrite = true)
+            csv.copyTo(file, overwrite = true)
             LocalSnapshot(date, day.revision, file)
         }
-    }
-
-    private suspend fun exportLocked(day: ArchiveDay) {
-        val records = dao.records(day.date)
-        val csv = File(csvDirectory, "${day.date}.csv")
-        if (records.isEmpty()) csv.delete() else atomicWrite(csv) { out -> CsvCodec.write(out, records.asSequence().map { readRecord(payloadFile(it.eventId)) }) }
-        dao.saveDay(day.copy(exportedRevision = day.revision))
     }
 
     /** Only the caller that has just verified the remote candidate may request deletion. */

@@ -123,6 +123,34 @@ class ArchiveRepositoryTest {
         }
     }
 
+    @Test fun csvIsGeneratedOnDemandAndReusedForTheSameRevision() = runBlocking {
+        withRetentionRepository { repository, _, _ ->
+            val date = "2026-01-15"
+            val dailyCsv = File(repository.csvDirectory, "$date.csv")
+            repository.capture(captureForDate(date, "第一版"))
+            assertFalse(dailyCsv.exists())
+
+            val first = requireNotNull(repository.snapshot(date))
+            val firstHash = sha256(first.file)
+            assertTrue(dailyCsv.setLastModified(1_600_000_000_000L))
+            val cachedAt = dailyCsv.lastModified()
+            val unchanged = requireNotNull(repository.snapshot(date))
+            assertEquals(firstHash, sha256(unchanged.file))
+            assertEquals(cachedAt, dailyCsv.lastModified())
+
+            repository.capture(captureForDate(date, "第二版"))
+            val updated = requireNotNull(repository.snapshot(date))
+            val updatedHash = sha256(updated.file)
+            assertNotEquals(firstHash, updatedHash)
+            assertEquals(firstHash, sha256(first.file))
+
+            assertTrue(dailyCsv.delete())
+            val regenerated = requireNotNull(repository.snapshot(date))
+            assertEquals(updated.revision, regenerated.revision)
+            assertEquals(updatedHash, sha256(regenerated.file))
+        }
+    }
+
     @Test fun snapshotRetryFinishesAnInterruptedDeletionInTheSameProcess() = runBlocking {
         withRetentionRepository { repository, settings, root ->
             val configuration = settings.get()
