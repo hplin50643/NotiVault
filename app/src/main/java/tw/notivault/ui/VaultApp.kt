@@ -1,7 +1,6 @@
 @file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 package tw.notivault.ui
 
-import android.content.ComponentName
 import android.content.Intent
 import android.provider.Settings
 import androidx.compose.animation.AnimatedVisibility
@@ -32,14 +31,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.app.NotificationManagerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.launch
+import tw.notivault.ListenerReconnectState
 import tw.notivault.VaultViewModel
-import tw.notivault.capture.VaultNotificationListener
 import tw.notivault.data.AppSettings
 import tw.notivault.data.DayCount
 import java.text.NumberFormat
@@ -66,8 +64,8 @@ fun VaultApp(model: VaultViewModel) {
     val context = LocalContext.current
     val owner = LocalLifecycleOwner.current
     var authorized by remember { mutableStateOf(false) }
-    fun refreshPermission() { authorized = context.packageName in NotificationManagerCompat.getEnabledListenerPackages(context) }
-    DisposableEffect(owner) {
+    fun refreshPermission() { authorized = model.hasNotificationAccess() }
+    DisposableEffect(owner, model) {
         refreshPermission()
         val observer = LifecycleEventObserver { _, event -> if (event == Lifecycle.Event.ON_RESUME) refreshPermission() }
         owner.lifecycle.addObserver(observer); onDispose { owner.lifecycle.removeObserver(observer) }
@@ -144,7 +142,9 @@ private fun Dashboard(model: VaultViewModel, counts: List<DayCount>, authorized:
     val settings by model.settings.collectAsStateWithLifecycle()
     val storage by model.storage.collectAsStateWithLifecycle()
     val captureError by model.captureError.collectAsStateWithLifecycle()
+    val reconnectState by model.listenerReconnect.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val showAutostartSettings = authorized && !connected && isXiaomiOrPocoDevice()
     val today = LocalDate.now(ZoneId.of(settings.zoneId))
     val total = counts.sumOf { it.count }
     val todayCount = counts.find { it.date == today.toString() }?.count ?: 0
@@ -188,10 +188,41 @@ private fun Dashboard(model: VaultViewModel, counts: List<DayCount>, authorized:
                     IconTile(Icons.Rounded.NotificationsActive, MaterialTheme.colorScheme.secondary)
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text(if (!authorized) "開始保存你的通知" else if (!connected) "通知服務尚未連線" else "保存狀態需處理", fontWeight = FontWeight.SemiBold)
-                        Text(captureError ?: if (!authorized) "開啟通知存取權限後，系統通知就會自動留存。" else "可重新啟用通知存取權限；強制停止 App 期間無法收集通知。", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        val connectionHint = when {
+                            !authorized -> "開啟通知存取權限後，系統通知就會自動留存。"
+                            connected -> null
+                            reconnectState == ListenerReconnectState.TimedOut -> "等待逾時，系統尚未連線。"
+                            reconnectState == ListenerReconnectState.Failed -> "無法向系統提出重新連線要求。"
+                            else -> null
+                        }
+                        connectionHint?.let { Text(it, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                        if (showAutostartSettings) {
+                            Text(BACKGROUND_AUTOSTART_INSTRUCTIONS, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        captureError?.let { Text(it, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     }
                 }
-                OutlinedButton(onClick = { if (authorized) android.service.notification.NotificationListenerService.requestRebind(ComponentName(context, VaultNotificationListener::class.java)) else openNotificationAccess(context) }, modifier = Modifier.fillMaxWidth()) { Text(if (authorized) "重新連線" else "開啟通知存取") }
+                if (!authorized) {
+                    OutlinedButton({ openNotificationAccess(context) }, Modifier.fillMaxWidth()) { Text("開啟通知存取") }
+                } else if (!connected) {
+                    val connecting = reconnectState == ListenerReconnectState.Connecting
+                    OutlinedButton(model::reconnectListener, Modifier.fillMaxWidth(), enabled = !connecting) {
+                        if (connecting) {
+                            CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(8.dp))
+                        }
+                        Text(if (connecting) "重新連線中…" else "重新連線")
+                    }
+                    if (showAutostartSettings) {
+                        TextButton(onClick = {
+                            if (!openBackgroundAutostartSettings(context)) {
+                                model.notify("無法直接開啟設定，請依畫面上的路徑手動開啟。")
+                            }
+                        }, modifier = Modifier.fillMaxWidth()) { Text("開啟背景自動啟動設定") }
+                    } else if (reconnectState == ListenerReconnectState.TimedOut || reconnectState == ListenerReconnectState.Failed) {
+                        TextButton({ openNotificationAccess(context) }, Modifier.fillMaxWidth()) { Text("管理通知存取權限") }
+                    }
+                }
             }
         }
         item {

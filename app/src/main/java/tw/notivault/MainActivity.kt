@@ -1,6 +1,11 @@
 package tw.notivault
 
+import android.app.NotificationManager
+import android.content.ComponentName
+import android.os.Build
 import android.os.Bundle
+import android.service.notification.NotificationListenerService
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -12,6 +17,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import tw.notivault.capture.VaultNotificationListener
 import tw.notivault.core.NotificationRecord
 import tw.notivault.data.*
 import tw.notivault.ui.VaultApp
@@ -19,6 +27,10 @@ import tw.notivault.backup.DavRequestTiming
 
 data class ConnectionTestState(val running: Boolean = false, val stage: String = "", val result: String? = null,
     val failed: Boolean = false, val elapsedMillis: Long = 0, val requests: List<DavRequestTiming> = emptyList())
+
+internal enum class ListenerReconnectState { Idle, Connecting, TimedOut, Failed }
+
+private const val LISTENER_RECONNECT_TIMEOUT_MILLIS = 8_000L
 
 class MainActivity : ComponentActivity() {
     private val model: VaultViewModel by viewModels()
@@ -35,6 +47,10 @@ class VaultViewModel(application: android.app.Application) : AndroidViewModel(ap
     val counts = graph.repository.counts.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
     val apps = graph.repository.apps.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
     val connected = graph.listenerConnected
+    private val listenerComponent = ComponentName(application, VaultNotificationListener::class.java)
+    private val notificationManager = application.getSystemService(NotificationManager::class.java)
+    private val reconnectState = MutableStateFlow(ListenerReconnectState.Idle)
+    internal val listenerReconnect = reconnectState.asStateFlow()
     val busy = graph.backup.busy
     val syncInProgress = graph.backup.syncInProgress
     val backupQueued = graph.backup.observeBackupQueued().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
@@ -46,8 +62,52 @@ class VaultViewModel(application: android.app.Application) : AndroidViewModel(ap
     val connectionTest = MutableStateFlow(ConnectionTestState())
     private var connectionTestJob: Job? = null
     val remote = RemoteHistoryStore(application)
-    init { viewModelScope.launch(Dispatchers.IO) { counts.collect { storage.value = graph.repository.storageBytes() } } }
+    init {
+        viewModelScope.launch(Dispatchers.IO) { counts.collect { storage.value = graph.repository.storageBytes() } }
+        viewModelScope.launch {
+            connected.filter { it }.collect {
+                reconnectState.update { if (it == ListenerReconnectState.Connecting) it else ListenerReconnectState.Idle }
+            }
+        }
+    }
     fun notify(text: String) { message.value = text }
+
+    internal fun hasNotificationAccess(): Boolean =
+        notificationManager.isNotificationListenerAccessGranted(listenerComponent)
+
+    internal fun reconnectListener() {
+        if (reconnectState.value == ListenerReconnectState.Connecting || connected.value) return
+        if (!hasNotificationAccess()) {
+            reconnectState.value = ListenerReconnectState.Idle
+            notify("請先授予通知存取權限")
+            return
+        }
+        reconnectState.value = ListenerReconnectState.Connecting
+        viewModelScope.launch {
+            try {
+                val didConnect = withTimeoutOrNull(LISTENER_RECONNECT_TIMEOUT_MILLIS) {
+                    withContext(Dispatchers.IO) {
+                        if (!connected.value) {
+                            // An already enabled listener may be skipped by requestRebind alone.
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                                NotificationListenerService.requestUnbind(listenerComponent)
+                            }
+                            NotificationListenerService.requestRebind(listenerComponent)
+                        }
+                    }
+                    connected.first { it }
+                } == true || connected.value
+                reconnectState.value = if (didConnect) ListenerReconnectState.Idle else ListenerReconnectState.TimedOut
+                if (didConnect) notify("通知服務已連線")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: RuntimeException) {
+                Log.w("VaultNotificationListener", "Unable to request listener rebind", failure)
+                reconnectState.value = ListenerReconnectState.Failed
+            }
+        }
+    }
+
     fun update(transform: (AppSettings) -> AppSettings) { viewModelScope.launch(Dispatchers.IO) {
         runCatching { graph.settings.update(transform) }.onFailure { notify("設定儲存失敗：${it.message}") }
     } }
